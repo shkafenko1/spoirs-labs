@@ -149,7 +149,8 @@ def download_file(host: str, port: int, remote_name: str, local_path: str):
         if pkt.opcode == protocol.ERROR:
             print(f"\nServer Error: {pkt.error_msg}")
             f.close()
-            os.remove(local_path)
+            if os.path.exists(local_path):
+                os.remove(local_path)
             return
 
         if pkt.opcode == protocol.DATA:
@@ -173,7 +174,7 @@ def download_file(host: str, port: int, remote_name: str, local_path: str):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
-    ap.add_argument("--port", type=int, default=6000)
+    ap.add_argument("--port", type=int, default=6969)
     sub = ap.add_subparsers(dest="cmd", required=True)
     
     up = sub.add_parser("upload")
