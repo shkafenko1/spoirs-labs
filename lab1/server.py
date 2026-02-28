@@ -2,282 +2,300 @@ import argparse
 import logging
 import os
 import socket
-import time
-from typing import Optional, Tuple
+import sys
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
-import protocol
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-
-DEFAULT_TIMEOUT = 3.0
-DEFAULT_RETRIES = 5
-
-
-def _is_valid_filename(name: str) -> bool:
-    if not name:
-        return False
-    if "/" in name or "\\" in name:
-        return False
-    if name in (".", ".."):
-        return False
-    if "\x00" in name:
-        return False
-    return True
+from common import protocol
 
 
-def _safe_join(root: str, filename: str) -> str:
-    root_abs = os.path.abspath(root)
-    path = os.path.abspath(os.path.join(root_abs, filename))
-    if os.path.commonpath([root_abs, path]) != root_abs:
-        raise ValueError("path traversal")
-    return path
+LOG = logging.getLogger("lab1.server")
 
 
-def _recv_from(sock: socket.socket, timeout: float) -> Tuple[bytes, Tuple[str, int]]:
-    sock.settimeout(timeout)
-    data, addr = sock.recvfrom(4096)
-    return data, addr
+@dataclass
+class PartialTransfer:
+    client_ip: str
+    direction: str  # 'upload' or 'download'
+    filename: str
+    total_size: int
+    offset: int
+    tmp_path: str
 
 
-def _send(sock: socket.socket, addr: Tuple[str, int], pkt: bytes) -> None:
-    sock.sendto(pkt, addr)
+def _send_line(conn: socket.socket, line: bytes) -> None:
+    conn.sendall(line)
 
 
-def _send_error(sock: socket.socket, addr: Tuple[str, int], code: int, msg: str) -> None:
-    try:
-        _send(sock, addr, protocol.build_error(code, msg))
-    except Exception:
-        logging.exception("failed to send error to %s", addr)
+def _recv_line(buf: bytearray, conn: socket.socket, max_len: int = 8192) -> str:
+    while True:
+        nl = buf.find(b"\n")
+        if nl != -1:
+            raw = bytes(buf[: nl + 1])
+            del buf[: nl + 1]
+            return raw.decode("utf-8", errors="replace")
+
+        if len(buf) > max_len:
+            raise protocol.ProtocolError("line too long")
+
+        chunk = conn.recv(4096)
+        if chunk == b"":
+            raise ConnectionError("connection closed")
+        buf.extend(chunk)
 
 
-def handle_rrq(sock: socket.socket, client: Tuple[str, int], root: str, filename: str, timeout: float, retries: int) -> None:
-    if not _is_valid_filename(filename):
-        _send_error(sock, client, protocol.ERR_ILLEGAL_OPERATION, "Invalid file name")
-        return
-
-    path = _safe_join(root, filename)
-
-    try:
-        f = open(path, "rb")
-    except FileNotFoundError:
-        _send_error(sock, client, protocol.ERR_FILE_NOT_FOUND, "File not found")
-        return
-    except PermissionError:
-        _send_error(sock, client, protocol.ERR_ACCESS_VIOLATION, "Access denied")
-        return
-    except OSError:
-        _send_error(sock, client, protocol.ERR_UNDEFINED, "Cannot open file")
-        return
-
-    with f:
-        block = 1
-        while True:
-            chunk = f.read(protocol.MAX_DATA_LEN)
-            if chunk is None:
-                chunk = b""
-
-            pkt = protocol.build_data(block, chunk)
-            attempts = 0
-
-            while True:
-                _send(sock, client, pkt)
-
-                try:
-                    resp_raw, resp_addr = _recv_from(sock, timeout)
-                except socket.timeout:
-                    attempts += 1
-                    if attempts > retries:
-                        logging.warning("RRQ %s: timeout waiting ACK block %d from %s", filename, block, client)
-                        return
-                    continue
-
-                if resp_addr != client:
-                    continue
-
-                try:
-                    resp = protocol.parse_packet(resp_raw)
-                except protocol.ProtocolError:
-                    _send_error(sock, client, protocol.ERR_MALFORMED_PACKET, "Malformed packet")
-                    return
-
-                if resp.opcode == protocol.ERROR:
-                    logging.info("RRQ %s aborted by client %s: %d %s", filename, client, resp.block, resp.error_msg)
-                    return
-
-                if resp.opcode != protocol.ACK or resp.block != block:
-                    continue
-
-                break
-
-            if len(chunk) < protocol.MAX_DATA_LEN:
-                return
-
-            block = (block + 1) & 0xFFFF
-            if block == 0:
-                block = 1
+def _recv_exact(buf: bytearray, conn: socket.socket, n: int) -> bytes:
+    out = bytearray()
+    while len(out) < n:
+        if buf:
+            take = min(len(buf), n - len(out))
+            out += buf[:take]
+            del buf[:take]
+            continue
+        chunk = conn.recv(min(65536, n - len(out)))
+        if chunk == b"":
+            raise ConnectionError("connection closed")
+        out += chunk
+    return bytes(out)
 
 
-def handle_wrq(sock: socket.socket, client: Tuple[str, int], root: str, filename: str, allow_overwrite: bool, timeout: float, retries: int) -> None:
-    if not _is_valid_filename(filename):
-        _send_error(sock, client, protocol.ERR_ILLEGAL_OPERATION, "Invalid file name")
-        return
+def _format_time() -> str:
+    import datetime
 
-    path = _safe_join(root, filename)
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    if not allow_overwrite and os.path.exists(path):
-        _send_error(sock, client, protocol.ERR_FILE_EXISTS, "File already exists")
-        return
 
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except Exception:
-        _send_error(sock, client, protocol.ERR_ACCESS_VIOLATION, "Cannot create directory")
-        return
+def handle_client(
+    conn: socket.socket,
+    addr: Tuple[str, int],
+    root: str,
+    allow_overwrite: bool,
+    partials: Dict[Tuple[str, str], PartialTransfer],
+    chunk_size: int,
+) -> None:
+    client_ip, _client_port = addr
+    LOG.info("connected: %s", addr)
+    protocol.set_tcp_keepalive(conn)
 
-    try:
-        f = open(path, "wb")
-    except PermissionError:
-        _send_error(sock, client, protocol.ERR_ACCESS_VIOLATION, "Access denied")
-        return
-    except OSError:
-        _send_error(sock, client, protocol.ERR_UNDEFINED, "Cannot open file")
-        return
+    buf = bytearray()
+    while True:
+        line = _recv_line(buf, conn)
+        cmd = protocol.parse_command_line(line)
 
-    with f:
-        ack0 = protocol.build_ack(0)
-        _send(sock, client, ack0)
+        if cmd.name in ("CLOSE", "QUIT", "EXIT"):
+            _send_line(conn, protocol.format_ok("BYE"))
+            return
 
-        expected = 1
-        last_ack = ack0
-        idle_timeouts = 0
-        while True:
+        if cmd.name == "TIME":
+            _send_line(conn, (_format_time() + "\n").encode("utf-8"))
+            continue
+
+        if cmd.name == "ECHO":
+            text = cmd.raw[len(cmd.raw.split()[0]) :].lstrip()
+            _send_line(conn, (text + "\n").encode("utf-8"))
+            continue
+
+        if cmd.name == "UPLOAD":
+            if len(cmd.args) != 2:
+                _send_line(conn, protocol.format_err("usage: UPLOAD <remote_filename> <size>"))
+                continue
+            filename, size_s = cmd.args
+            if not protocol.safe_filename(filename):
+                _send_line(conn, protocol.format_err("invalid filename"))
+                continue
             try:
-                raw, addr = _recv_from(sock, timeout)
-            except socket.timeout:
-                # retransmit last ack to prompt client
-                idle_timeouts += 1
-                if idle_timeouts > retries:
-                    logging.warning("WRQ %s: timeout waiting DATA block %d from %s", filename, expected, client)
-                    return
-                _send(sock, client, last_ack)
+                total_size = int(size_s)
+            except ValueError:
+                _send_line(conn, protocol.format_err("invalid size"))
+                continue
+            if total_size < 0:
+                _send_line(conn, protocol.format_err("invalid size"))
                 continue
 
-            if addr != client:
+            os.makedirs(root, exist_ok=True)
+            final_path = protocol.safe_join(root, filename)
+            tmp_path = final_path + ".part"
+
+            if os.path.exists(final_path) and not allow_overwrite:
+                _send_line(conn, protocol.format_err("file exists"))
                 continue
 
-            idle_timeouts = 0
+            key = (client_ip, filename)
+            offset = 0
+            if key in partials:
+                st = partials[key]
+                if st.direction == "upload" and st.total_size == total_size and os.path.exists(st.tmp_path):
+                    offset = os.path.getsize(st.tmp_path)
 
-            try:
-                pkt = protocol.parse_packet(raw)
-            except protocol.ProtocolError:
-                _send_error(sock, client, protocol.ERR_MALFORMED_PACKET, "Malformed packet")
-                return
+            if offset > total_size:
+                offset = 0
 
-            if pkt.opcode == protocol.ERROR:
-                logging.info("WRQ %s aborted by client %s: %d %s", filename, client, pkt.block, pkt.error_msg)
-                return
-
-            if pkt.opcode == protocol.WRQ and pkt.block == 0:
-                _send(sock, client, ack0)
-                last_ack = ack0
-                continue
-
-            if pkt.opcode != protocol.DATA:
-                _send_error(sock, client, protocol.ERR_ILLEGAL_OPERATION, "Expected DATA")
-                return
-
-            if pkt.block == expected:
+            if offset == 0:
                 try:
-                    f.write(pkt.data or b"")
-                    f.flush()
+                    os.makedirs(os.path.dirname(final_path), exist_ok=True)
                 except OSError:
-                    _send_error(sock, client, protocol.ERR_ACCESS_VIOLATION, "Write failed")
-                    return
+                    _send_line(conn, protocol.format_err("cannot create directory"))
+                    continue
 
-                ack = protocol.build_ack(expected)
-                _send(sock, client, ack)
-                last_ack = ack
+                try:
+                    with open(tmp_path, "wb"):
+                        pass
+                except OSError:
+                    _send_line(conn, protocol.format_err("cannot open file"))
+                    continue
 
-                if len(pkt.data or b"") < protocol.MAX_DATA_LEN:
-                    return
+            partials[key] = PartialTransfer(
+                client_ip=client_ip,
+                direction="upload",
+                filename=filename,
+                total_size=total_size,
+                offset=offset,
+                tmp_path=tmp_path,
+            )
 
-                expected = (expected + 1) & 0xFFFF
-                if expected == 0:
-                    expected = 1
-            elif pkt.block == ((expected - 1) & 0xFFFF):
-                # duplicate data, re-ack
-                _send(sock, client, last_ack)
-            else:
-                # ignore out of order
-                _send(sock, client, last_ack)
+            _send_line(conn, protocol.format_ok("OFFSET", offset))
+
+            remaining = total_size - offset
+            start_t = protocol.monotonic()
+            bytes_written = 0
+            try:
+                with open(tmp_path, "r+b") as f:
+                    f.seek(offset)
+                    while remaining > 0:
+                        to_read = min(chunk_size, remaining)
+                        data = _recv_exact(buf, conn, to_read)
+                        f.write(data)
+                        bytes_written += len(data)
+                        remaining -= len(data)
+
+                os.replace(tmp_path, final_path)
+                end_t = protocol.monotonic()
+                dur = max(1e-6, end_t - start_t)
+                bps = int(bytes_written / dur)
+                _send_line(conn, protocol.format_ok("DONE", bytes_written, f"{dur:.3f}", bps))
+                partials.pop(key, None)
+                LOG.info("upload complete: client=%s file=%s bytes=%d time=%.3fs bps=%d", addr, filename, bytes_written, dur, bps)
+            except (ConnectionError, OSError) as e:
+                LOG.warning("upload interrupted: client=%s file=%s err=%s", addr, filename, e)
+            continue
+
+        if cmd.name == "DOWNLOAD":
+            if len(cmd.args) not in (1, 2):
+                _send_line(conn, protocol.format_err("usage: DOWNLOAD <remote_filename> [<offset>]"))
+                continue
+            filename = cmd.args[0]
+            if not protocol.safe_filename(filename):
+                _send_line(conn, protocol.format_err("invalid filename"))
+                continue
+            try:
+                offset_req = int(cmd.args[1]) if len(cmd.args) == 2 else 0
+            except ValueError:
+                _send_line(conn, protocol.format_err("invalid offset"))
+                continue
+            if offset_req < 0:
+                _send_line(conn, protocol.format_err("invalid offset"))
+                continue
+
+            final_path = protocol.safe_join(root, filename)
+            if not os.path.exists(final_path) or not os.path.isfile(final_path):
+                _send_line(conn, protocol.format_err("file not found"))
+                continue
+
+            total_size = os.path.getsize(final_path)
+            offset = min(offset_req, total_size)
+            key = (client_ip, filename)
+            partials[key] = PartialTransfer(
+                client_ip=client_ip,
+                direction="download",
+                filename=filename,
+                total_size=total_size,
+                offset=offset,
+                tmp_path=final_path,
+            )
+
+            _send_line(conn, protocol.format_ok("SIZE", total_size, "OFFSET", offset))
+
+            start_t = protocol.monotonic()
+            sent = 0
+            try:
+                with open(final_path, "rb") as f:
+                    f.seek(offset)
+                    remaining = total_size - offset
+                    while remaining > 0:
+                        data = f.read(min(chunk_size, remaining))
+                        if not data:
+                            break
+                        conn.sendall(data)
+                        sent += len(data)
+                        remaining -= len(data)
+                end_t = protocol.monotonic()
+                dur = max(1e-6, end_t - start_t)
+                bps = int(sent / dur)
+                _send_line(conn, protocol.format_ok("DONE", sent, f"{dur:.3f}", bps))
+                partials.pop(key, None)
+                LOG.info("download complete: client=%s file=%s bytes=%d time=%.3fs bps=%d", addr, filename, sent, dur, bps)
+            except (ConnectionError, OSError) as e:
+                LOG.warning("download interrupted: client=%s file=%s err=%s", addr, filename, e)
+            continue
+
+        _send_line(conn, protocol.format_err("unknown command"))
 
 
-def serve_forever(host: str, port: int, root: str, allow_overwrite: bool, timeout: float, retries: int) -> None:
+def serve_forever(host: str, port: int, root: str, allow_overwrite: bool, chunk_size: int) -> None:
     os.makedirs(root, exist_ok=True)
+    LOG.info("server starting (TCP) on %s:%d root=%s", host, port, os.path.abspath(root))
 
-    logging.info("server starting on %s:%d root=%s", host, port, os.path.abspath(root))
+    partials: Dict[Tuple[str, str], PartialTransfer] = {}
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind((host, port))
+    lsock.listen(1)
     try:
-        sock.bind((host, port))
-
         while True:
+            conn, addr = lsock.accept()
             try:
-                data, addr = sock.recvfrom(4096)
+                handle_client(conn, addr, root, allow_overwrite, partials, chunk_size)
             except KeyboardInterrupt:
-                break
+                raise
             except Exception:
-                logging.exception("recvfrom failed")
-                continue
-
-            try:
-                pkt = protocol.parse_packet(data)
-            except protocol.ProtocolError:
-                logging.warning("malformed packet from %s", addr)
-                _send_error(sock, addr, protocol.ERR_MALFORMED_PACKET, "Malformed packet")
-                continue
-
-            if pkt.opcode == protocol.RRQ:
-                logging.info("request from %s RRQ %s", addr, pkt.filename)
+                LOG.exception("client handler error: %s", addr)
+            finally:
                 try:
-                    handle_rrq(sock, addr, root, pkt.filename or "", timeout, retries)
+                    conn.close()
                 except Exception:
-                    logging.exception("RRQ handler failed for %s", addr)
-                    _send_error(sock, addr, protocol.ERR_UNDEFINED, "Server error")
-            elif pkt.opcode == protocol.WRQ:
-                logging.info("request from %s WRQ %s", addr, pkt.filename)
-                try:
-                    handle_wrq(sock, addr, root, pkt.filename or "", allow_overwrite, timeout, retries)
-                except Exception:
-                    logging.exception("WRQ handler failed for %s", addr)
-                    _send_error(sock, addr, protocol.ERR_UNDEFINED, "Server error")
-            else:
-                _send_error(sock, addr, protocol.ERR_ILLEGAL_OPERATION, "Illegal operation")
+                    pass
+                LOG.info("disconnected: %s", addr)
 
+            keep_keys = {k for k, st in partials.items() if st.client_ip == addr[0]}
+            partials = {k: partials[k] for k in keep_keys}
     finally:
         try:
-            sock.close()
+            lsock.close()
         except Exception:
             pass
-        logging.info("server stopped")
+        LOG.info("server stopped")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", required=True)
-    ap.add_argument("--port", required=True, type=int)
-    ap.add_argument("--root", required=True)
-    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
-    ap.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
-    ap.add_argument("--allow-overwrite", action="store_true", default=False)
+    ap = argparse.ArgumentParser(description="Lab1 TCP command + file transfer server (sequential)")
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=9000)
+    ap.add_argument("--root", default="./storage")
+    ap.add_argument("--allow-overwrite", action="store_true")
+    ap.add_argument("--chunk", type=int, default=65536)
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    serve_forever(args.host, args.port, args.root, args.allow_overwrite, args.timeout, args.retries)
+    serve_forever(args.host, args.port, args.root, args.allow_overwrite, args.chunk)
 
 
 if __name__ == "__main__":

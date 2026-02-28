@@ -1,238 +1,336 @@
 import argparse
+import logging
 import os
 import socket
 import sys
-from typing import Tuple
-
-import protocol
-
-
-DEFAULT_TIMEOUT = 3.0
-DEFAULT_RETRIES = 5
+from pathlib import Path
+from typing import Optional, Tuple
 
 
-def _stderr(msg: str) -> None:
-    sys.stderr.write(msg + "\n")
-    sys.stderr.flush()
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from common import protocol
 
 
-def _stdout(msg: str) -> None:
-    sys.stdout.write(msg + "\n")
-    sys.stdout.flush()
+LOG = logging.getLogger("lab1.client")
 
 
-def _recv(sock: socket.socket, timeout: float) -> Tuple[bytes, Tuple[str, int]]:
-    sock.settimeout(timeout)
-    return sock.recvfrom(4096)
+def _connect(host: str, port: int, timeout_s: float) -> socket.socket:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout_s)
+    s.connect((host, port))
+    protocol.set_tcp_keepalive(s)
+    return s
 
 
-def _expect_from(addr_expected: Tuple[str, int], addr_got: Tuple[str, int]) -> bool:
-    return addr_expected == addr_got
+def _recv_line(sock: socket.socket, buf: bytearray, timeout_s: float) -> str:
+    sock.settimeout(timeout_s)
+    while True:
+        nl = buf.find(b"\n")
+        if nl != -1:
+            raw = bytes(buf[: nl + 1])
+            del buf[: nl + 1]
+            return raw.decode("utf-8", errors="replace")
+        chunk = sock.recv(4096)
+        if chunk == b"":
+            raise ConnectionError("connection closed")
+        buf.extend(chunk)
 
 
-def download(host: str, port: int, remote_filename: str, local_path: str, timeout: float, retries: int) -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server = (host, port)
+def _recv_exact(sock: socket.socket, buf: bytearray, n: int, timeout_s: float) -> bytes:
+    sock.settimeout(timeout_s)
+    out = bytearray()
+    while len(out) < n:
+        if buf:
+            take = min(len(buf), n - len(out))
+            out += buf[:take]
+            del buf[:take]
+            continue
+        chunk = sock.recv(min(65536, n - len(out)))
+        if chunk == b"":
+            raise ConnectionError("connection closed")
+        out += chunk
+    return bytes(out)
 
-    rrq = protocol.build_rrq(remote_filename, "octet")
-    _stdout(f"Downloading {remote_filename} -> {local_path}")
 
-    last_sent = rrq
-    expecting_block = 1
+def _send_line(sock: socket.socket, line: str) -> None:
+    sock.sendall(line.encode("utf-8"))
 
+
+def _parse_ok_offset(line: str) -> int:
+    cmd = protocol.parse_command_line(line)
+    if cmd.name != "OK":
+        raise protocol.ProtocolError("expected OK")
+    parts = cmd.args
+    if len(parts) != 2 or parts[0].upper() != "OFFSET":
+        raise protocol.ProtocolError("expected OK OFFSET <n>")
+    return int(parts[1])
+
+
+def _parse_ok_size_offset(line: str) -> Tuple[int, int]:
+    cmd = protocol.parse_command_line(line)
+    if cmd.name != "OK":
+        raise protocol.ProtocolError("expected OK")
+    parts = [p for p in cmd.args]
+    if len(parts) != 4:
+        raise protocol.ProtocolError("expected OK SIZE <n> OFFSET <m>")
+    if parts[0].upper() != "SIZE" or parts[2].upper() != "OFFSET":
+        raise protocol.ProtocolError("expected OK SIZE <n> OFFSET <m>")
+    return int(parts[1]), int(parts[3])
+
+
+def _is_err(line: str) -> bool:
     try:
-        with open(local_path, "wb") as out:
-            attempts = 0
-            sock.sendto(last_sent, server)
-
-            while True:
-                try:
-                    raw, addr = _recv(sock, timeout)
-                except socket.timeout:
-                    attempts += 1
-                    if attempts > retries:
-                        _stderr("Error: timeout")
-                        return 1
-                    sock.sendto(last_sent, server)
-                    continue
-
-                if not _expect_from(server, addr):
-                    continue
-
-                attempts = 0
-
-                try:
-                    pkt = protocol.parse_packet(raw)
-                except protocol.ProtocolError:
-                    err = protocol.build_error(protocol.ERR_MALFORMED_PACKET, "Malformed packet")
-                    sock.sendto(err, server)
-                    _stderr("Error: malformed packet")
-                    return 1
-
-                if pkt.opcode == protocol.ERROR:
-                    _stderr(f"ERROR {pkt.block}: {pkt.error_msg}")
-                    return 1
-
-                if pkt.opcode != protocol.DATA:
-                    err = protocol.build_error(protocol.ERR_ILLEGAL_OPERATION, "Expected DATA")
-                    sock.sendto(err, server)
-                    _stderr("Error: illegal operation")
-                    return 1
-
-                if pkt.block == expecting_block:
-                    data = pkt.data or b""
-                    out.write(data)
-                    ack = protocol.build_ack(expecting_block)
-                    sock.sendto(ack, server)
-                    last_sent = ack
-
-                    if len(data) < protocol.MAX_DATA_LEN:
-                        _stdout("Done")
-                        return 0
-
-                    expecting_block = (expecting_block + 1) & 0xFFFF
-                    if expecting_block == 0:
-                        expecting_block = 1
-                elif pkt.block == ((expecting_block - 1) & 0xFFFF):
-                    ack = protocol.build_ack(pkt.block)
-                    sock.sendto(ack, server)
-                    last_sent = ack
-                else:
-                    ack = protocol.build_ack((expecting_block - 1) & 0xFFFF)
-                    sock.sendto(ack, server)
-                    last_sent = ack
-
-    except OSError as e:
-        _stderr(f"Error: cannot write {local_path}: {e}")
-        return 1
-    finally:
-        sock.close()
+        cmd = protocol.parse_command_line(line)
+    except Exception:
+        return False
+    return cmd.name == "ERR"
 
 
-def upload(host: str, port: int, local_path: str, remote_filename: str, timeout: float, retries: int) -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server = (host, port)
-
+def _prompt_retry() -> bool:
     try:
-        f = open(local_path, "rb")
-    except OSError as e:
-        _stderr(f"Error: cannot read {local_path}: {e}")
-        return 1
+        ans = input("Retry transfer? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return ans in ("y", "yes")
 
-    _stdout(f"Uploading {local_path} -> {remote_filename}")
 
-    with f:
-        wrq = protocol.build_wrq(remote_filename, "octet")
-        last_sent = wrq
+def upload_file(
+    host: str,
+    port: int,
+    local_path: Path,
+    remote_filename: str,
+    timeout_s: float,
+    progress_timeout_s: float,
+    max_auto_reconnect: int,
+    non_interactive: bool,
+) -> int:
+    size = local_path.stat().st_size
+    attempts = 0
+    notified = False
 
-        attempts = 0
-        sock.sendto(last_sent, server)
-
-        while True:
+    while True:
+        buf = bytearray()
+        try:
+            sock = _connect(host, port, timeout_s)
             try:
-                raw, addr = _recv(sock, timeout)
-            except socket.timeout:
-                attempts += 1
-                if attempts > retries:
-                    _stderr("Error: timeout")
+                _send_line(sock, f"UPLOAD {remote_filename} {size}\n")
+                line = _recv_line(sock, buf, timeout_s)
+                if _is_err(line):
+                    sys.stderr.write(line)
                     return 1
-                sock.sendto(last_sent, server)
-                continue
+                offset = _parse_ok_offset(line)
 
-            if not _expect_from(server, addr):
-                continue
+                start_t = protocol.monotonic()
+                last_progress = start_t
+                sent = 0
 
-            attempts = 0
+                with local_path.open("rb") as f:
+                    f.seek(offset)
+                    remaining = size - offset
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            raise OSError("unexpected EOF")
+                        sock.sendall(chunk)
+                        sent += len(chunk)
+                        remaining -= len(chunk)
+                        last_progress = protocol.monotonic()
 
-            try:
-                pkt = protocol.parse_packet(raw)
-            except protocol.ProtocolError:
-                err = protocol.build_error(protocol.ERR_MALFORMED_PACKET, "Malformed packet")
-                sock.sendto(err, server)
-                _stderr("Error: malformed packet")
-                return 1
+                        if protocol.monotonic() - last_progress > progress_timeout_s:
+                            raise TimeoutError("no progress")
 
-            if pkt.opcode == protocol.ERROR:
-                _stderr(f"ERROR {pkt.block}: {pkt.error_msg}")
-                return 1
-
-            if pkt.opcode != protocol.ACK or pkt.block != 0:
-                continue
-
-            break
-
-        block = 1
-        while True:
-            chunk = f.read(protocol.MAX_DATA_LEN)
-            if chunk is None:
-                chunk = b""
-
-            data_pkt = protocol.build_data(block, chunk)
-            last_sent = data_pkt
-            sock.sendto(last_sent, server)
-
-            attempts = 0
-            while True:
-                try:
-                    raw, addr = _recv(sock, timeout)
-                except socket.timeout:
-                    attempts += 1
-                    if attempts > retries:
-                        _stderr("Error: timeout")
-                        return 1
-                    sock.sendto(last_sent, server)
-                    continue
-
-                if not _expect_from(server, addr):
-                    continue
-
-                try:
-                    resp = protocol.parse_packet(raw)
-                except protocol.ProtocolError:
-                    continue
-
-                if resp.opcode == protocol.ERROR:
-                    _stderr(f"ERROR {resp.block}: {resp.error_msg}")
+                done_line = _recv_line(sock, buf, timeout_s)
+                if _is_err(done_line):
+                    sys.stderr.write(done_line)
                     return 1
-
-                if resp.opcode == protocol.ACK and resp.block == block:
-                    break
-
-            if len(chunk) < protocol.MAX_DATA_LEN:
-                _stdout("Done")
+                end_t = protocol.monotonic()
+                dur = max(1e-6, end_t - start_t)
+                bps = int(sent / dur)
+                LOG.info("upload done: file=%s bytes=%d time=%.3fs bps=%d", remote_filename, sent, dur, bps)
                 return 0
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        except (OSError, ConnectionError, TimeoutError) as e:
+            attempts += 1
+            if attempts <= max_auto_reconnect:
+                if not notified:
+                    sys.stderr.write(f"Connection problem detected, trying to восстановить передачу... ({e})\n")
+                    notified = True
+                continue
+            if non_interactive:
+                sys.stderr.write(f"Transfer failed: {e}\n")
+                return 1
+            if _prompt_retry():
+                attempts = 0
+                continue
+            sys.stderr.write(f"Transfer aborted: {e}\n")
+            return 1
 
-            block = (block + 1) & 0xFFFF
-            if block == 0:
-                block = 1
 
-    sock.close()
-    return 0
+def download_file(
+    host: str,
+    port: int,
+    remote_filename: str,
+    local_path: Path,
+    timeout_s: float,
+    progress_timeout_s: float,
+    max_auto_reconnect: int,
+    non_interactive: bool,
+) -> int:
+    part_path = local_path.with_suffix(local_path.suffix + ".part")
+    attempts = 0
+    notified = False
+
+    while True:
+        buf = bytearray()
+        try:
+            sock = _connect(host, port, timeout_s)
+            try:
+                offset = part_path.stat().st_size if part_path.exists() else 0
+                _send_line(sock, f"DOWNLOAD {remote_filename} {offset}\n")
+                line = _recv_line(sock, buf, timeout_s)
+                if _is_err(line):
+                    sys.stderr.write(line)
+                    return 1
+                total_size, offset_server = _parse_ok_size_offset(line)
+                if offset_server != offset:
+                    offset = offset_server
+
+                start_t = protocol.monotonic()
+                last_progress = start_t
+                received = 0
+
+                os.makedirs(str(local_path.parent), exist_ok=True)
+                with part_path.open("ab") as f:
+                    remaining = total_size - offset
+                    while remaining > 0:
+                        to_read = min(65536, remaining)
+                        data = _recv_exact(sock, buf, to_read, timeout_s)
+                        f.write(data)
+                        received += len(data)
+                        remaining -= len(data)
+                        last_progress = protocol.monotonic()
+
+                        if protocol.monotonic() - last_progress > progress_timeout_s:
+                            raise TimeoutError("no progress")
+
+                done_line = _recv_line(sock, buf, timeout_s)
+                if _is_err(done_line):
+                    sys.stderr.write(done_line)
+                    return 1
+
+                os.replace(part_path, local_path)
+                end_t = protocol.monotonic()
+                dur = max(1e-6, end_t - start_t)
+                bps = int(received / dur)
+                LOG.info("download done: file=%s bytes=%d time=%.3fs bps=%d", remote_filename, received, dur, bps)
+                return 0
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        except (OSError, ConnectionError, TimeoutError) as e:
+            attempts += 1
+            if attempts <= max_auto_reconnect:
+                if not notified:
+                    sys.stderr.write(f"Connection problem detected, trying to восстановить передачу... ({e})\n")
+                    notified = True
+                continue
+            if non_interactive:
+                sys.stderr.write(f"Transfer failed: {e}\n")
+                return 1
+            if _prompt_retry():
+                attempts = 0
+                continue
+            sys.stderr.write(f"Transfer aborted: {e}\n")
+            return 1
+
+
+def send_simple_command(host: str, port: int, cmd_line: str, timeout_s: float) -> int:
+    buf = bytearray()
+    try:
+        sock = _connect(host, port, timeout_s)
+        try:
+            if not cmd_line.endswith("\n"):
+                cmd_line += "\n"
+            _send_line(sock, cmd_line)
+            resp = _recv_line(sock, buf, timeout_s)
+            sys.stdout.write(resp)
+            return 0
+        finally:
+            sock.close()
+    except OSError as e:
+        sys.stderr.write(f"Error: {e}\n")
+        return 1
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", required=True)
-    ap.add_argument("--port", required=True, type=int)
-    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
-    ap.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    ap = argparse.ArgumentParser(description="Lab1 TCP client (commands + file transfer)")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=9000)
+    ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--progress-timeout", type=float, default=120.0)
+    ap.add_argument("--max-auto-reconnect", type=int, default=1)
+    ap.add_argument("--non-interactive", action="store_true")
+    ap.add_argument("--log-level", default="INFO")
 
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    d = sub.add_parser("download")
-    d.add_argument("remote_filename")
-    d.add_argument("local_path")
+    s = sub.add_parser("send")
+    s.add_argument("command", help="raw command line, e.g. 'TIME' or 'ECHO hello'")
 
     u = sub.add_parser("upload")
     u.add_argument("local_path")
     u.add_argument("remote_filename")
 
+    d = sub.add_parser("download")
+    d.add_argument("remote_filename")
+    d.add_argument("local_path")
+
     args = ap.parse_args()
 
-    if args.cmd == "download":
-        raise SystemExit(download(args.host, args.port, args.remote_filename, args.local_path, args.timeout, args.retries))
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    if args.cmd == "send":
+        raise SystemExit(send_simple_command(args.host, args.port, args.command, args.timeout))
+
     if args.cmd == "upload":
-        raise SystemExit(upload(args.host, args.port, args.local_path, args.remote_filename, args.timeout, args.retries))
+        raise SystemExit(
+            upload_file(
+                args.host,
+                args.port,
+                Path(args.local_path),
+                args.remote_filename,
+                args.timeout,
+                args.progress_timeout,
+                args.max_auto_reconnect,
+                args.non_interactive,
+            )
+        )
+
+    if args.cmd == "download":
+        raise SystemExit(
+            download_file(
+                args.host,
+                args.port,
+                args.remote_filename,
+                Path(args.local_path),
+                args.timeout,
+                args.progress_timeout,
+                args.max_auto_reconnect,
+                args.non_interactive,
+            )
+        )
 
 
 if __name__ == "__main__":
