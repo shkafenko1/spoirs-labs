@@ -15,7 +15,6 @@ ERR_DISK_FULL = 3
 ERR_ILLEGAL_OP = 4
 ERR_FILE_EXISTS = 6
 
-# Оптимальный размер payload для Ethernet MTU 1500
 MAX_DATA_LEN = 1400
 
 class ProtocolError(ValueError):

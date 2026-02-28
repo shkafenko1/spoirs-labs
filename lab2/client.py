@@ -9,19 +9,19 @@ from typing import Dict
 
 import protocol
 
-# --- CONFIG FOR SPEED ---
-WINDOW_SIZE = 512
-TIMEOUT = 0.05
+WINDOW_SIZE = 64
+TIMEOUT = 0.1
 MAX_RETRIES = 20
-SOCKET_BUF_SIZE = 4 * 1024 * 1024 
+SOCKET_BUF_SIZE = 1 * 1024 * 1024
 
-def configure_fast_socket(sock: socket.socket):
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF_SIZE)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
+def configure_socket(sock: socket.socket):
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF_SIZE)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
+    except: pass
 
 def _print_progress(bytes_transferred):
-    # Выводим реже, чтобы не тормозить консоль
-    if bytes_transferred % (1024 * 1024) < 2000: 
+    if bytes_transferred % (512 * 1024) < 2000: 
         sys.stdout.write(f"\rTransferred: {bytes_transferred / 1024 / 1024:.2f} MB")
         sys.stdout.flush()
 
@@ -35,7 +35,7 @@ def calc_speed(bytes_cnt, seconds):
 def udp_upload(host: str, port: int, local_path: str, remote_name: str):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server = (host, port)
-    configure_fast_socket(sock)
+    configure_socket(sock)
     
     try:
         f = open(local_path, "rb")
@@ -47,16 +47,20 @@ def udp_upload(host: str, port: int, local_path: str, remote_name: str):
     print(f"[UDP] Uploading {local_path} ({file_size} bytes)")
     sock.sendto(protocol.build_wrq(remote_name), server)
     
-    # Handshake wait
-    sock.settimeout(1.0)
+    # Wait for ACK 0
+    sock.settimeout(2.0)
     try:
-        raw, _ = sock.recvfrom(1024)
-        if protocol.parse(raw).opcode != protocol.ACK: return
+        data, _ = sock.recvfrom(1024)
+        if len(data) >= 4:
+            opcode = struct.unpack("!H", data[:2])[0]
+            if opcode != protocol.ACK:
+                print("Bad handshake")
+                return
     except socket.timeout:
         print("Server unreachable")
         return
+    sock.settimeout(None)
 
-    sock.setblocking(False)
     start_time = time.time()
     
     base = 1
@@ -64,7 +68,7 @@ def udp_upload(host: str, port: int, local_path: str, remote_name: str):
     window_buff: Dict[int, bytes] = {}
     eof = False
     total_sent = 0
-    last_ack_time = time.time()
+    timeouts = 0
 
     with f:
         while base <= next_seq or not eof:
@@ -77,42 +81,35 @@ def udp_upload(host: str, port: int, local_path: str, remote_name: str):
                 
                 pkt = protocol.build_data(next_seq, chunk)
                 window_buff[next_seq] = pkt
-                try:
-                    sock.sendto(pkt, server)
-                except BlockingIOError: break
-                
+                sock.sendto(pkt, server)
                 total_sent += len(chunk)
                 next_seq += 1
             
             _print_progress(total_sent)
 
-            # Fast ACK check
-            try:
-                while True:
+            ready = select.select([sock], [], [], TIMEOUT)
+            if ready[0]:
+                try:
                     raw, _ = sock.recvfrom(1024)
-                    # Quick parse
-                    if len(raw) < 4: continue
-                    # opcode check
-                    if raw[0] == 0 and raw[1] == protocol.ACK:
-                        ack_val = raw[2]*256 + raw[3]
-                        if ack_val >= (base & 0xFFFF):
-                            shift = ack_val - (base & 0xFFFF) + 1
-                            if shift < 0: shift += 65536
-                            for _ in range(shift):
-                                if base in window_buff: del window_buff[base]
-                                base += 1
-                            last_ack_time = time.time()
-            except BlockingIOError: pass
-
-            if time.time() - last_ack_time > TIMEOUT:
-                if base in window_buff:
-                    try:
-                        sock.sendto(window_buff[base], server)
-                    except BlockingIOError: pass
-                last_ack_time = time.time()
-
-            if next_seq >= base + WINDOW_SIZE:
-                time.sleep(0.001)
+                    if len(raw) >= 4:
+                        opcode = struct.unpack("!H", raw[:2])[0]
+                        if opcode == protocol.ACK:
+                            ack_val = struct.unpack("!H", raw[2:4])[0]
+                            if ack_val >= (base & 0xFFFF):
+                                shift = ack_val - (base & 0xFFFF) + 1
+                                for _ in range(shift):
+                                    if base in window_buff: del window_buff[base]
+                                    base += 1
+                                timeouts = 0
+                except: pass
+            else:
+                timeouts += 1
+                if timeouts > MAX_RETRIES:
+                    print("\nConnection timed out!")
+                    return
+                for seq in range(base, next_seq):
+                    if seq in window_buff:
+                        sock.sendto(window_buff[seq], server)
 
     print(f"\n[UDP] Done! Speed: {calc_speed(total_sent, time.time() - start_time)}")
     sock.close()
@@ -120,7 +117,7 @@ def udp_upload(host: str, port: int, local_path: str, remote_name: str):
 def udp_download(host: str, port: int, remote_name: str, local_path: str):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server = (host, port)
-    configure_fast_socket(sock)
+    configure_socket(sock)
     
     print(f"[UDP] Downloading {remote_name}")
     sock.sendto(protocol.build_rrq(remote_name), server)
@@ -129,49 +126,50 @@ def udp_download(host: str, port: int, remote_name: str, local_path: str):
         f = open(local_path, "wb")
     except OSError: return
 
-    sock.setblocking(False)
     start_time = time.time()
     expected = 1
     total_recv = 0
-    last_act_time = time.time()
+    timeouts = 0
 
     while True:
+        ready = select.select([sock], [], [], TIMEOUT)
+        if not ready[0]:
+            timeouts += 1
+            if timeouts > MAX_RETRIES:
+                print("\nTimeout")
+                break
+            if expected == 1:
+                sock.sendto(protocol.build_rrq(remote_name), server)
+            else:
+                sock.sendto(protocol.build_ack((expected - 1) & 0xFFFF), server)
+            continue
+
         try:
             raw, addr = sock.recvfrom(4096)
             if addr != server: continue
             
             if len(raw) < 4: continue
-            opcode = raw[0]*256 + raw[1]
+            opcode = struct.unpack("!H", raw[:2])[0]
             
             if opcode == protocol.DATA:
-                block = raw[2]*256 + raw[3]
+                block = struct.unpack("!H", raw[2:4])[0]
                 if block == (expected & 0xFFFF):
                     data = raw[4:]
                     f.write(data)
                     total_recv += len(data)
                     
-                    ack = struct.pack("!HH", protocol.ACK, block)
-                    sock.sendto(ack, server)
-                    
+                    sock.sendto(protocol.build_ack(expected), server)
                     expected += 1
-                    last_act_time = time.time()
+                    timeouts = 0
                     _print_progress(total_recv)
                     
                     if len(data) < protocol.MAX_DATA_LEN: break
                 elif block == ((expected - 1) & 0xFFFF):
-                     ack = struct.pack("!HH", protocol.ACK, block)
-                     sock.sendto(ack, server)
-                     last_act_time = time.time()
+                     sock.sendto(protocol.build_ack(block), server)
             elif opcode == protocol.ERROR:
                 print("Error from server")
                 break
-        except BlockingIOError:
-            if time.time() - last_act_time > 1.0:
-                # Resend request if silent
-                if expected == 1: sock.sendto(protocol.build_rrq(remote_name), server)
-                else: sock.sendto(struct.pack("!HH", protocol.ACK, (expected-1)&0xFFFF), server)
-                last_act_time = time.time()
-            time.sleep(0.0001)
+        except Exception: pass
 
     print(f"\n[UDP] Done! Speed: {calc_speed(total_recv, time.time() - start_time)}")
     sock.close()
@@ -188,7 +186,7 @@ def tcp_upload(host: str, port: int, local_path: str, remote_name: str):
 
     print(f"[TCP] Uploading {local_path} ({file_size} bytes)")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    configure_fast_socket(sock)
+    configure_socket(sock)
     
     try:
         sock.connect((host, port))
@@ -217,7 +215,7 @@ def tcp_upload(host: str, port: int, local_path: str, remote_name: str):
 def tcp_download(host: str, port: int, remote_name: str, local_path: str):
     print(f"[TCP] Downloading {remote_name}")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    configure_fast_socket(sock)
+    configure_socket(sock)
     
     try:
         sock.connect((host, port))

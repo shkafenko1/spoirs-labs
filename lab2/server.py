@@ -8,16 +8,17 @@ from typing import Tuple, Dict
 
 import protocol
 
-# --- CONFIG FOR SPEED ---
-WINDOW_SIZE = 512       # Огромное окно для высокой скорости
-TIMEOUT = 0.05          # Очень короткий таймаут для быстрой реакции
+WINDOW_SIZE = 64
+TIMEOUT = 0.1
 MAX_RETRIES = 20
-SOCKET_BUF_SIZE = 4 * 1024 * 1024  # 4 MB буфер сокета (ОЧЕНЬ ВАЖНО)
+SOCKET_BUF_SIZE = 1 * 1024 * 1024  # 1 MB
 
-def configure_fast_socket(sock: socket.socket):
-    """Расширяем системные буферы, чтобы ядро не отбрасывало пакеты"""
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF_SIZE)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
+def configure_socket(sock: socket.socket):
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF_SIZE)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
+    except:
+        pass
 
 # --- UDP LOGIC ---
 
@@ -28,9 +29,7 @@ def udp_send_file(sock: socket.socket, client_addr: Tuple[str, int], filepath: s
         sock.sendto(protocol.build_error(protocol.ERR_FILE_NOT_FOUND, "File not found"), client_addr)
         return
 
-    configure_fast_socket(sock)
-    sock.setblocking(False)
-
+    configure_socket(sock)
     start_time = time.time()
     
     base = 1
@@ -38,11 +37,11 @@ def udp_send_file(sock: socket.socket, client_addr: Tuple[str, int], filepath: s
     window_buff: Dict[int, bytes] = {}
     eof = False
     total_sent = 0
-    last_ack_time = time.time()
+    consecutive_timeouts = 0
 
     with f:
         while base <= next_seq or not eof:
-            # 1. Burst Sending (Заполняем окно до отказа)
+            # 1. Fill Window
             while next_seq < base + WINDOW_SIZE and not eof:
                 chunk = f.read(protocol.MAX_DATA_LEN)
                 if not chunk:
@@ -53,51 +52,43 @@ def udp_send_file(sock: socket.socket, client_addr: Tuple[str, int], filepath: s
                 
                 pkt = protocol.build_data(next_seq, chunk)
                 window_buff[next_seq] = pkt
-                try:
-                    sock.sendto(pkt, client_addr)
-                except BlockingIOError:
-                    break # Сокет переполнен, ждем
-                
+                sock.sendto(pkt, client_addr)
                 total_sent += len(chunk)
                 next_seq += 1
 
-            # 2. Non-blocking ACK receive
-            try:
-                while True: # Читаем все накопившиеся ACK
+            if eof and base == next_seq:
+                break
+
+            # 2. Wait for ACK
+            ready = select.select([sock], [], [], TIMEOUT)
+            if ready[0]:
+                try:
                     raw, addr = sock.recvfrom(4096)
                     if addr != client_addr: continue
-                    parsed = protocol.parse(raw)
                     
-                    if parsed.opcode == protocol.ACK:
-                        ack_val = parsed.block
-                        # Cumulative ACK logic
-                        if ack_val >= (base & 0xFFFF):
-                            shift = ack_val - (base & 0xFFFF) + 1
-                            # Корректировка на переполнение (упрощенно)
-                            if shift < 0: shift += 65536 
-                            
-                            # Сдвигаем окно
-                            for _ in range(shift):
-                                if base in window_buff: del window_buff[base]
-                                base += 1
-                            last_ack_time = time.time()
-                    elif parsed.opcode == protocol.ERROR:
-                        return
-            except BlockingIOError:
-                pass # Нет данных, не страшно
-
-            # 3. Timeout & Retransmission
-            if time.time() - last_ack_time > TIMEOUT:
-                # Если застряли - перепосылаем только базу, чтобы "пробить" затор
-                if base in window_buff:
-                    try:
-                        sock.sendto(window_buff[base], client_addr)
-                    except BlockingIOError: pass
-                last_ack_time = time.time() # Сброс таймера, чтобы не спамить
-
-            # Небольшой yield, чтобы не вешать CPU на 100%, если окно полно
-            if next_seq >= base + WINDOW_SIZE:
-                time.sleep(0.001)
+                    if len(raw) >= 4:
+                        opcode = struct.unpack("!H", raw[:2])[0]
+                        if opcode == protocol.ACK:
+                            ack_val = struct.unpack("!H", raw[2:4])[0]
+                            # Handle wrap-around or simple linear logic
+                            # For lab simple logic: assuming no 64k wrap-around collisions in small window
+                            if ack_val >= (base & 0xFFFF):
+                                shift = ack_val - (base & 0xFFFF) + 1
+                                for _ in range(shift):
+                                    if base in window_buff: del window_buff[base]
+                                    base += 1
+                                consecutive_timeouts = 0
+                        elif opcode == protocol.ERROR:
+                            return
+                except Exception: pass
+            else:
+                consecutive_timeouts += 1
+                if consecutive_timeouts > MAX_RETRIES:
+                    return
+                # Retransmit window
+                for seq in range(base, next_seq):
+                    if seq in window_buff:
+                        sock.sendto(window_buff[seq], client_addr)
 
     duration = time.time() - start_time
     speed = (total_sent * 8 / 1_000_000) / (duration if duration > 0 else 1)
@@ -113,58 +104,47 @@ def udp_recv_file(sock: socket.socket, client_addr: Tuple[str, int], filepath: s
         sock.sendto(protocol.build_error(protocol.ERR_ACCESS_VIOLATION, "Cannot create file"), client_addr)
         return
 
-    configure_fast_socket(sock)
-    sock.setblocking(False)
+    configure_socket(sock)
+    sock.sendto(protocol.build_ack(0), client_addr)
 
     start_time = time.time()
-    # Отправляем ACK 0 несколько раз для надежности старта
-    for _ in range(3):
-        sock.sendto(protocol.build_ack(0), client_addr)
-    
     expected_block = 1
     total_received = 0
-    last_act_time = time.time()
+    timeouts = 0
 
     while True:
+        ready = select.select([sock], [], [], TIMEOUT)
+        if not ready[0]:
+            timeouts += 1
+            if timeouts > MAX_RETRIES: break
+            # Resend last ACK
+            sock.sendto(protocol.build_ack((expected_block - 1) & 0xFFFF), client_addr)
+            continue
+
         try:
             raw, addr = sock.recvfrom(4096)
             if addr != client_addr: continue
             
-            # Парсим вручную для скорости (можно оптимизировать parse, но пока так)
-            # opcode(2) + block(2)
             if len(raw) < 4: continue
-            opcode = raw[0] * 256 + raw[1] # !H
+            opcode = struct.unpack("!H", raw[:2])[0]
             
             if opcode == protocol.DATA:
-                block = raw[2] * 256 + raw[3] # !H
-                
+                block = struct.unpack("!H", raw[2:4])[0]
                 if block == (expected_block & 0xFFFF):
                     data = raw[4:]
                     f.write(data)
                     total_received += len(data)
                     
-                    # ACK
-                    ack_pkt = struct.pack("!HH", protocol.ACK, expected_block & 0xFFFF)
-                    sock.sendto(ack_pkt, client_addr)
-                    
+                    sock.sendto(protocol.build_ack(expected_block), client_addr)
                     expected_block += 1
-                    last_act_time = time.time()
+                    timeouts = 0
                     
                     if len(data) < protocol.MAX_DATA_LEN:
                         break
                 elif block == ((expected_block - 1) & 0xFFFF):
-                    # Повтор ACK для предыдущего
-                    ack_pkt = struct.pack("!HH", protocol.ACK, block)
-                    sock.sendto(ack_pkt, client_addr)
-                    last_act_time = time.time()
-        
-        except BlockingIOError:
-            # Если данных нет долго - проверяем таймаут
-            if time.time() - last_act_time > 2.0: # 2 сек тишины - выход
-                print("Receive timeout")
-                break
-            time.sleep(0.0001) # Микро-сон, чтобы не жарить CPU
-            
+                    sock.sendto(protocol.build_ack(block), client_addr)
+        except Exception: pass
+
     f.close()
     duration = time.time() - start_time
     speed = (total_received * 8 / 1_000_000) / (duration if duration > 0 else 1)
@@ -173,16 +153,16 @@ def udp_recv_file(sock: socket.socket, client_addr: Tuple[str, int], filepath: s
 def run_udp_server(host: str, port: int, root: str, allow_overwrite: bool):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
-    configure_fast_socket(sock)
-    print(f"Fast UDP Server listening on {host}:{port}")
+    configure_socket(sock)
+    print(f"UDP Server listening on {host}:{port}")
 
     while True:
         try:
             data, addr = sock.recvfrom(4096)
-            # Простой парсинг для диспетчера
             if len(data) < 2: continue
             opcode = struct.unpack("!H", data[:2])[0]
             
+            # Simple parse just to get filename
             parsed = protocol.parse(data)
         except Exception: continue
 
@@ -192,6 +172,8 @@ def run_udp_server(host: str, port: int, root: str, allow_overwrite: bool):
         elif opcode == protocol.WRQ:
             safe_path = os.path.join(root, os.path.basename(parsed.filename))
             udp_recv_file(sock, addr, safe_path, allow_overwrite)
+        else:
+            sock.sendto(protocol.build_error(protocol.ERR_ILLEGAL_OP, "Expected RRQ/WRQ"), addr)
 
 # --- TCP LOGIC ---
 def run_tcp_server(host: str, port: int, root: str, allow_overwrite: bool):
