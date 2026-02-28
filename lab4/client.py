@@ -3,39 +3,44 @@ import sys
 import os
 import time
 
-HOST = '127.0.0.1'
+# Порт должен совпадать с сервером
 PORT = 9999
 
 def send_file(sock, filename):
     if not os.path.exists(filename):
-        print("File not found")
+        print("Файл не найден")
         return
     filesize = os.path.getsize(filename)
-    # Отправка команды
     sock.sendall(f"UPLOAD {filename} {filesize}\n".encode())
     
-    # Ждем подтверждения
     resp = sock.recv(1024).decode()
     if "READY" not in resp:
-        print(f"Server refused: {resp}")
+        print(f"Сервер отклонил: {resp}")
         return
 
-    print("Sending data...")
+    print("Отправка данных...")
     with open(filename, 'rb') as f:
-        data = f.read(4096)
-        while data:
-            sock.sendall(data)
+        while True:
             data = f.read(4096)
+            if not data: break
+            sock.sendall(data)
     
-    # Ждем отчета о битрейте
     print(sock.recv(1024).decode())
 
 def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    # Запрос IP адреса у пользователя
+    print("Ведите IP сервера (нажмите Enter для 127.0.0.1):")
+    target_ip = input("> ").strip()
+    if not target_ip:
+        target_ip = '127.0.0.1'
+
     try:
-        s.connect((HOST, PORT))
-        print(f"Connected to {HOST}:{PORT}")
-        print("Commands: ECHO <txt>, TIME, UPLOAD <file>, DOWNLOAD <file>, CLOSE")
+        print(f"Попытка подключения к {target_ip}:{PORT}...")
+        s.connect((target_ip, PORT))
+        print(f"Успешно подключено!")
+        print("Команды: ECHO <текст>, TIME, UPLOAD <файл>, DOWNLOAD <файл>, CLOSE")
         
         while True:
             cmd = input("Command> ")
@@ -49,18 +54,20 @@ def main():
                     print("Usage: UPLOAD filename")
                 continue
 
-            # Обычные команды
             s.sendall((cmd + "\n").encode())
             
             if cmd.strip().upper() == 'CLOSE':
                 break
                 
-            # Чтение ответа
             data = s.recv(4096)
             print("Server:", data.decode(errors='ignore').strip())
             
     except ConnectionRefusedError:
-        print("Connection failed. Is server running?")
+        print("Ошибка: Не удалось подключиться. Проверьте IP и запущен ли сервер.")
+    except TimeoutError:
+        print("Ошибка: Таймаут. Возможно, Брандмауэр блокирует порт 9999 на сервере.")
+    except Exception as e:
+        print(f"Ошибка: {e}")
     finally:
         s.close()
 
