@@ -261,6 +261,9 @@ def serve_forever(host: str, port: int, root: str, allow_overwrite: bool, chunk_
                 handle_client(conn, addr, root, allow_overwrite, partials, chunk_size)
             except KeyboardInterrupt:
                 raise
+            except ConnectionError as e:
+                # Catch sudden client disconnects gracefully instead of logging full traceback
+                LOG.warning("client disconnected abruptly: %s (%s)", addr, e)
             except Exception:
                 LOG.exception("client handler error: %s", addr)
             finally:
