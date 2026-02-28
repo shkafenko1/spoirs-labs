@@ -4,6 +4,7 @@ import os
 import time
 import select
 import sys
+import struct
 from typing import Dict
 
 import protocol
@@ -21,41 +22,33 @@ def calc_speed(bytes_cnt, seconds):
     mbps = (bytes_cnt * 8) / (seconds * 1_000_000)
     return f"{mbps:.2f} Mbps"
 
-def upload_file(host: str, port: int, local_path: str, remote_name: str):
+# --- UDP CLIENT ---
+
+def udp_upload(host: str, port: int, local_path: str, remote_name: str):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_addr = (host, port)
-    
+    server = (host, port)
     try:
         f = open(local_path, "rb")
         file_size = os.path.getsize(local_path)
     except OSError:
-        print("Cannot open local file")
+        print("Error reading file")
         return
 
-    print(f"Uploading {local_path} -> {remote_name} ({file_size} bytes)")
-    
-    sock.sendto(protocol.build_wrq(remote_name), server_addr)
+    print(f"[UDP] Uploading {local_path} ({file_size} bytes)")
+    sock.sendto(protocol.build_wrq(remote_name), server)
     
     sock.settimeout(TIMEOUT)
     try:
-        raw, addr = sock.recvfrom(1024)
-        pkt = protocol.parse(raw)
-        if pkt.opcode == protocol.ERROR:
-            print(f"\nServer error: {pkt.error_msg}")
-            return
-        if pkt.opcode != protocol.ACK or pkt.block != 0:
-            print("\nDid not receive ACK 0")
-            return
+        raw, _ = sock.recvfrom(1024)
+        if protocol.parse(raw).opcode != protocol.ACK: return
     except socket.timeout:
-        print("\nServer unreachable")
+        print("Server unreachable")
         return
 
     sock.setblocking(False)
     start_time = time.time()
-    
-    base = 1
-    next_seq = 1
-    window: Dict[int, bytes] = {}
+    base, next_seq = 1, 1
+    window = {}
     eof = False
     total_sent = 0
     timeouts = 0
@@ -67,19 +60,15 @@ def upload_file(host: str, port: int, local_path: str, remote_name: str):
                 if not chunk:
                     eof = True
                     break
-                if len(chunk) < protocol.MAX_DATA_LEN:
-                    eof = True
-                
+                if len(chunk) < protocol.MAX_DATA_LEN: eof = True
                 pkt = protocol.build_data(next_seq, chunk)
                 window[next_seq] = pkt
-                sock.sendto(pkt, server_addr)
+                sock.sendto(pkt, server)
                 total_sent += len(chunk)
                 next_seq += 1
             
             _print_progress(total_sent)
-
-            if eof and base == next_seq:
-                break
+            if eof and base == next_seq: break
 
             ready = select.select([sock], [], [], TIMEOUT)
             if ready[0]:
@@ -87,40 +76,31 @@ def upload_file(host: str, port: int, local_path: str, remote_name: str):
                     raw, _ = sock.recvfrom(1024)
                     ack = protocol.parse(raw)
                     if ack.opcode == protocol.ACK:
-                        ack_num = ack.block
-                        if ack_num >= (base & 0xFFFF):
-                            shift = ack_num - (base & 0xFFFF) + 1
+                        if ack.block >= (base & 0xFFFF):
+                            shift = ack.block - (base & 0xFFFF) + 1
                             for _ in range(shift):
                                 if base in window: del window[base]
                                 base += 1
                             timeouts = 0
-                except Exception: pass
+                except: pass
             else:
                 timeouts += 1
-                if timeouts > MAX_RETRIES:
-                    print("\nConnection timed out!")
-                    return
+                if timeouts > MAX_RETRIES: return
                 for i in range(base, next_seq):
-                    if i in window:
-                        sock.sendto(window[i], server_addr)
+                    if i in window: sock.sendto(window[i], server)
 
-    duration = time.time() - start_time
-    print(f"\nUpload Complete! Speed: {calc_speed(total_sent, duration)}")
+    print(f"\n[UDP] Done! Speed: {calc_speed(total_sent, time.time() - start_time)}")
     sock.close()
 
-def download_file(host: str, port: int, remote_name: str, local_path: str):
+def udp_download(host: str, port: int, remote_name: str, local_path: str):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_addr = (host, port)
-    
-    print(f"Downloading {remote_name} -> {local_path}")
-    
-    sock.sendto(protocol.build_rrq(remote_name), server_addr)
+    server = (host, port)
+    print(f"[UDP] Downloading {remote_name}")
+    sock.sendto(protocol.build_rrq(remote_name), server)
     
     try:
         f = open(local_path, "wb")
-    except OSError:
-        print("Cannot create local file")
-        return
+    except OSError: return
 
     start_time = time.time()
     expected = 1
@@ -131,50 +111,115 @@ def download_file(host: str, port: int, remote_name: str, local_path: str):
         ready = select.select([sock], [], [], TIMEOUT)
         if not ready[0]:
             retries += 1
-            if retries > MAX_RETRIES:
-                print("\nTimeout receiving data")
-                break
-            if expected == 1:
-                sock.sendto(protocol.build_rrq(remote_name), server_addr)
-            else:
-                sock.sendto(protocol.build_ack((expected - 1) & 0xFFFF), server_addr)
+            if retries > MAX_RETRIES: break
+            if expected == 1: sock.sendto(protocol.build_rrq(remote_name), server)
+            else: sock.sendto(protocol.build_ack((expected - 1) & 0xFFFF), server)
             continue
 
         try:
             raw, addr = sock.recvfrom(4096)
-            if addr != server_addr: continue
+            if addr != server: continue
             pkt = protocol.parse(raw)
-        except Exception: continue
+        except: continue
 
         if pkt.opcode == protocol.ERROR:
-            print(f"\nServer Error: {pkt.error_msg}")
+            print(f"Error: {pkt.error_msg}")
             f.close()
-            if os.path.exists(local_path):
-                os.remove(local_path)
+            os.remove(local_path)
             return
 
         if pkt.opcode == protocol.DATA:
             if pkt.block == (expected & 0xFFFF):
                 f.write(pkt.data)
                 total_recv += len(pkt.data)
-                sock.sendto(protocol.build_ack(expected), server_addr)
+                sock.sendto(protocol.build_ack(expected), server)
                 expected += 1
                 retries = 0
                 _print_progress(total_recv)
-                
-                if len(pkt.data) < protocol.MAX_DATA_LEN:
-                    break
+                if len(pkt.data) < protocol.MAX_DATA_LEN: break
             elif pkt.block == ((expected - 1) & 0xFFFF):
-                sock.sendto(protocol.build_ack(pkt.block), server_addr)
+                sock.sendto(protocol.build_ack(pkt.block), server)
 
-    duration = time.time() - start_time
-    print(f"\nDownload Complete! Speed: {calc_speed(total_recv, duration)}")
+    print(f"\n[UDP] Done! Speed: {calc_speed(total_recv, time.time() - start_time)}")
     sock.close()
+
+# --- TCP CLIENT ---
+
+def tcp_upload(host: str, port: int, local_path: str, remote_name: str):
+    try:
+        f = open(local_path, "rb")
+        file_size = os.path.getsize(local_path)
+    except OSError:
+        print("File not found")
+        return
+
+    print(f"[TCP] Uploading {local_path} ({file_size} bytes)")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((host, port))
+        # Send WRQ Opcode + Name Len + Name
+        encoded_name = remote_name.encode('utf-8')
+        header = struct.pack("!BH", protocol.WRQ, len(encoded_name)) + encoded_name
+        sock.sendall(header)
+        
+        # Wait for OK
+        resp = sock.recv(1)
+        if resp != b'\x01':
+            print("Server rejected upload")
+            return
+
+        start_time = time.time()
+        total_sent = 0
+        while True:
+            chunk = f.read(16384)
+            if not chunk: break
+            sock.sendall(chunk)
+            total_sent += len(chunk)
+            _print_progress(total_sent)
+            
+        print(f"\n[TCP] Done! Speed: {calc_speed(total_sent, time.time() - start_time)}")
+    finally:
+        sock.close()
+        f.close()
+
+def tcp_download(host: str, port: int, remote_name: str, local_path: str):
+    print(f"[TCP] Downloading {remote_name}")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((host, port))
+        # Send RRQ Opcode + Name Len + Name
+        encoded_name = remote_name.encode('utf-8')
+        header = struct.pack("!BH", protocol.RRQ, len(encoded_name)) + encoded_name
+        sock.sendall(header)
+        
+        # Wait for OK
+        resp = sock.recv(1)
+        if resp != b'\x01':
+            print("Server rejected download (File not found?)")
+            return
+            
+        f = open(local_path, "wb")
+        start_time = time.time()
+        total_recv = 0
+        while True:
+            chunk = sock.recv(16384)
+            if not chunk: break
+            f.write(chunk)
+            total_recv += len(chunk)
+            _print_progress(total_recv)
+            
+        print(f"\n[TCP] Done! Speed: {calc_speed(total_recv, time.time() - start_time)}")
+    finally:
+        sock.close()
+        if 'f' in locals(): f.close()
+
+# --- MAIN ---
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", type=int, default=6969)
+    ap.add_argument("--protocol", choices=["tcp", "udp"], default="udp")
     sub = ap.add_subparsers(dest="cmd", required=True)
     
     up = sub.add_parser("upload")
@@ -187,7 +232,9 @@ if __name__ == "__main__":
     
     args = ap.parse_args()
     
-    if args.cmd == "upload":
-        upload_file(args.host, args.port, args.local, args.remote)
-    elif args.cmd == "download":
-        download_file(args.host, args.port, args.remote, args.local)
+    if args.protocol == "udp":
+        if args.cmd == "upload": udp_upload(args.host, args.port, args.local, args.remote)
+        elif args.cmd == "download": udp_download(args.host, args.port, args.remote, args.local)
+    else:
+        if args.cmd == "upload": tcp_upload(args.host, args.port, args.local, args.remote)
+        elif args.cmd == "download": tcp_download(args.host, args.port, args.remote, args.local)
