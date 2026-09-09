@@ -148,3 +148,54 @@ python3 lab3/client.py --host 127.0.0.1 --port 9000 download remote.bin ./copy.b
 - Linux
 - Python 3
 - Только стандартная библиотека (`socket`, `selectors`, `argparse`, `logging`, `os`, `time`, `pathlib` и т.д.)
+
+---
+
+## Лабораторные работы №5–8
+
+Подробные инструкции — в `labN/labN.md`. Кратко:
+
+### ЛР №5 — ICMP/IP: параллельный ping, traceroute, Smurf
+
+```bash
+sudo python3 lab5/ping.py 8.8.8.8 1.1.1.1 ya.ru      # параллельный ping (поток на хост, MSG_PEEK)
+sudo python3 lab5/ping.py --trace 8.8.8.8            # traceroute (рост TTL)
+sudo python3 lab5/smurf.py --victim 192.168.1.50 --broadcast 192.168.1.255
+```
+
+Raw-сокеты требуют прав root/administrator. Только стандартная библиотека.
+
+### ЛР №6 — broadcast + multicast: одноранговый чат
+
+```bash
+python3 lab6/chat.py --nick alice
+```
+
+Команды: `/who`, `/net`, `/nick`, `/leave`, `/join`, `/ignore <ip>`, `/quit`.
+Автоопределение IP/маски/broadcast, обнаружение участников, выход из группы,
+игнорирование хостов. Только стандартная библиотека.
+
+### ЛР №7 — MPI: парные операции (блокирующие/неблокирующие)
+
+```bash
+pip install -r requirements.txt          # numpy, mpi4py (нужна установленная MPI)
+mpirun -np 4 python3 lab7/matmul.py --size 1500 --mode both
+```
+
+### ЛР №8 — MPI: группы, коллективы, файловый ввод-вывод
+
+```bash
+python3 lab8/matmul_groups.py --make-input --size 1200 --dir ./shared
+mpirun --oversubscribe -np 8 python3 lab8/matmul_groups.py --size 1200 --groups 3 --dir ./shared
+```
+
+## Установка MPI (для ЛР №7–8)
+
+```bash
+# macOS
+brew install open-mpi
+# Debian/Ubuntu
+sudo apt install -y openmpi-bin libopenmpi-dev
+# затем
+pip install -r requirements.txt
+```
