@@ -48,13 +48,15 @@ def make_broadcast_socket(port: int) -> socket.socket:
     return s
 
 
-def make_multicast_socket(port: int) -> socket.socket:
-    """UDP-сокет, вступивший в multicast-группу."""
+def make_multicast_socket(port: int, local_ip: str) -> socket.socket:
+    """UDP-сокет для multicast: привязан к нужному интерфейсу, с loopback."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     _enable_reuseport(s)
     s.bind(("", port))
     s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_ip))
     return s
 
 
@@ -67,15 +69,15 @@ def _enable_reuseport(s: socket.socket) -> None:
             pass
 
 
-def join_group(sock: socket.socket, group: str) -> None:
-    """Вступает в multicast-группу (IP_ADD_MEMBERSHIP)."""
-    mreq = socket.inet_aton(group) + socket.inet_aton("0.0.0.0")
+def join_group(sock: socket.socket, group: str, local_ip: str) -> None:
+    """Вступает в multicast-группу на конкретном интерфейсе (IP_ADD_MEMBERSHIP)."""
+    mreq = socket.inet_aton(group) + socket.inet_aton(local_ip)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
 
-def leave_group(sock: socket.socket, group: str) -> None:
+def leave_group(sock: socket.socket, group: str, local_ip: str) -> None:
     """Выходит из multicast-группы (IP_DROP_MEMBERSHIP)."""
-    mreq = socket.inet_aton(group) + socket.inet_aton("0.0.0.0")
+    mreq = socket.inet_aton(group) + socket.inet_aton(local_ip)
     try:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
     except OSError:

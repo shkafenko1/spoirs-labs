@@ -17,28 +17,29 @@ import sys
 import net
 
 
-def ip_checksum(header: bytes) -> int:
-    """Контрольная сумма IP-заголовка (тот же алгоритм, что и для ICMP)."""
-    return net.checksum(header)
+def _bsd_header_order() -> bool:
+    """На BSD/macOS поля ip_len и ip_off передаются в порядке байт хоста."""
+    return sys.platform.startswith(("darwin", "freebsd", "openbsd", "netbsd"))
 
 
 def build_ip_header(src: str, dst: str, payload_len: int) -> bytes:
-    """Собирает IPv4-заголовок с подставным адресом источника (spoofing)."""
+    """Собирает IPv4-заголовок с подставным адресом источника (spoofing).
+
+    Контрольную сумму IP заполняет ядро (при chk=0 и IP_HDRINCL). Поля длины и
+    смещения на BSD/macOS пишутся в порядке байт хоста — иначе sendto даёт EINVAL.
+    """
     version_ihl = (4 << 4) | 5
     total_len = 20 + payload_len
-    header = struct.pack(
+    header = bytearray(struct.pack(
         "!BBHHHBBH4s4s",
         version_ihl, 0, total_len, 0, 0, 64,
         socket.IPPROTO_ICMP, 0,
         socket.inet_aton(src), socket.inet_aton(dst),
-    )
-    chk = ip_checksum(header)
-    return struct.pack(
-        "!BBHHHBBH4s4s",
-        version_ihl, 0, total_len, 0, 0, 64,
-        socket.IPPROTO_ICMP, chk,
-        socket.inet_aton(src), socket.inet_aton(dst),
-    )
+    ))
+    if _bsd_header_order():
+        struct.pack_into("=H", header, 2, total_len)  # ip_len в порядке хоста
+        struct.pack_into("=H", header, 6, 0)          # ip_off в порядке хоста
+    return bytes(header)
 
 
 def make_raw_socket() -> socket.socket:
