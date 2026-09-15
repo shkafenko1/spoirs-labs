@@ -163,9 +163,12 @@ def receive_loop(peer: ChatPeer) -> None:
     sel.register(peer.bcast, selectors.EVENT_READ)
     sel.register(peer.mcast, selectors.EVENT_READ)
     while peer.running:
-        for key, _ in sel.select(timeout=0.5):
-            data, addr = key.fileobj.recvfrom(65535)
-            _handle_datagram(peer, data, addr)
+        try:
+            for key, _ in sel.select(timeout=0.5):
+                data, addr = key.fileobj.recvfrom(65535)
+                _handle_datagram(peer, data, addr)
+        except OSError:
+            break  # сокеты закрываются при выходе — тихо завершаем поток
     sel.close()
 
 
