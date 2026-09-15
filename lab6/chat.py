@@ -27,6 +27,7 @@ import selectors
 import socket
 import sys
 import threading
+import collections
 import time
 import uuid
 
@@ -87,30 +88,33 @@ def leave_group(sock: socket.socket, group: str, local_ip: str) -> None:
 class ChatPeer:
     """Состояние одного участника чата (сокеты, список пиров, игнор-лист)."""
 
-    def __init__(self, nick: str, port: int):
+    def __init__(self, nick: str, port: int, preferred_ip: str = None):
         self.nick = nick
         self.port = port
         self.id = uuid.uuid4().hex[:8]  # уникальный идентификатор экземпляра
-        self.info = netinfo.interface_info()
+        self.info = netinfo.interface_info(preferred_ip)
+        self.local_ip = self.info["ip"]
         self.bcast = make_broadcast_socket(port)
-        self.mcast = make_multicast_socket(port)
-        join_group(self.mcast, MULTICAST_GROUP)
+        self.mcast = make_multicast_socket(port, self.local_ip)
+        join_group(self.mcast, MULTICAST_GROUP, self.local_ip)
         self.in_group = True
         self.peers = {}          # ip -> {"nick": str, "seen": float}
         self.ignored = set()     # игнорируемые ip
+        self.seen = collections.deque(maxlen=2048)  # id уже показанных сообщений
         self.running = True
         self.lock = threading.Lock()
 
     def close(self) -> None:
         """Сообщает о выходе и закрывает сокеты."""
         self.send({"type": "BYE", "nick": self.nick})
-        leave_group(self.mcast, MULTICAST_GROUP)
+        leave_group(self.mcast, MULTICAST_GROUP, self.local_ip)
         self.bcast.close()
         self.mcast.close()
 
     def send(self, message: dict) -> None:
         """Рассылает сообщение и по broadcast, и по multicast."""
         message["src"] = self.id
+        message["id"] = uuid.uuid4().hex  # уникальный id для дедупликации
         data = json.dumps(message).encode("utf-8")
         self.bcast.sendto(data, (self.info["broadcast"], self.port))
         if self.in_group:
@@ -134,6 +138,10 @@ def _handle_datagram(peer: ChatPeer, data: bytes, addr) -> None:
         return
     if msg.get("src") == peer.id:  # своё же сообщение (эхо broadcast/multicast)
         return
+    mid = msg.get("id")
+    if mid in peer.seen:           # дубль (пришёл и по broadcast, и по multicast)
+        return
+    peer.seen.append(mid)
     _remember_peer(peer, ip, msg.get("nick", "?"))
     _dispatch_message(peer, ip, msg)
 
@@ -205,7 +213,7 @@ def cmd_nick(peer: ChatPeer, arg: str) -> None:
 def cmd_leave(peer: ChatPeer, _arg: str) -> None:
     """Самостоятельный выход из multicast-группы."""
     if peer.in_group:
-        leave_group(peer.mcast, MULTICAST_GROUP)
+        leave_group(peer.mcast, MULTICAST_GROUP, peer.local_ip)
         peer.in_group = False
         print("* вы покинули multicast-группу (broadcast продолжает работать)")
 
@@ -213,7 +221,7 @@ def cmd_leave(peer: ChatPeer, _arg: str) -> None:
 def cmd_join(peer: ChatPeer, _arg: str) -> None:
     """Повторное вступление в multicast-группу."""
     if not peer.in_group:
-        join_group(peer.mcast, MULTICAST_GROUP)
+        join_group(peer.mcast, MULTICAST_GROUP, peer.local_ip)
         peer.in_group = True
         print("* вы снова в multicast-группе")
 
@@ -270,13 +278,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Одноранговый UDP-чат (ЛР6)")
     p.add_argument("--nick", default=socket.gethostname(), help="имя участника")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="UDP-порт")
+    p.add_argument("--ip", default=None, help="IP интерфейса LAN (если несколько/VPN)")
     return p
 
 
 def main(argv=None) -> int:
     """Точка входа: поднимает потоки приёма/маяка и читает ввод."""
     args = build_parser().parse_args(argv)
-    peer = ChatPeer(args.nick, args.port)
+    peer = ChatPeer(args.nick, args.port, args.ip)
     threading.Thread(target=receive_loop, args=(peer,), daemon=True).start()
     threading.Thread(target=beacon_loop, args=(peer,), daemon=True).start()
     try:
